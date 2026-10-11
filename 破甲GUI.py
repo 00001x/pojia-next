@@ -526,7 +526,7 @@ if CLOUD_MODE:
 
 # v8.5：核心改为后台线程加载 —— 窗口先弹出来，封印自检 / 类初始化在后台跑完
 # 再放行 API。启动体感快一截。核心没就绪时，所有接口返回「加载中」占位。
-DISPLAY_VER = "8.12"             # GUI 显示版本（核心 VERSION 以封印文件为准）
+DISPLAY_VER = "8.13"             # GUI 显示版本（核心 VERSION 以封印文件为准）
 # 2026-10-12：8.11 即当前发布版。更新弹窗统一跳转 GitHub Releases，
 # 服务器 version.json min_ver=8.11 会强制旧客户端更新，更新入口统一为 GitHub Releases。
 core = None
@@ -2960,7 +2960,7 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
              placeholder="输入 QQ 群号" maxlength="12" autocomplete="off"
              spellcheck="false">
       <input class="cinput" id="cloudcode"
-             placeholder="激活码（老用户不用填）" maxlength="16"
+             placeholder="激活码" maxlength="17"
              autocomplete="off" spellcheck="false"
              style="text-transform:uppercase">
       <button class="dbtn primary" id="b-cloudgo">验 证</button>
