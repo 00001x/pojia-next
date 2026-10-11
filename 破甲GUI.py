@@ -63,6 +63,122 @@ else:
 # exe 空壳化：核心脚本不进 exe，启动时从官方服务器拉取。
 _CLOUD_HOST = "103.212.186.16"
 _CLOUD_PORT = 443
+
+# v8.8.1：直连被阻断时的本地 socks5 兜底（纯标准库手搓，零依赖）。
+# 背景：部分网络（含作者本机）对服务器 443 存在间歇性 TLS 阻断，直连
+# EOF。实测走本地 socks5（1080 等）可通。端口探测一遍后缓存，后续秒切。
+_SOCKS_PORTS = (1080, 10808, 7891)
+_SOCKS_CACHE = {"port": None}
+
+class _CloudResp:
+    """socks5 路径的最小应答对象（对齐 urlopen 返回值的用到的字段）。"""
+    def __init__(self, headers, body):
+        import email.message
+        self.headers = email.message.Message()
+        for line in headers:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                self.headers[k.strip()] = v.strip()
+        self._body = body
+        self._pos = 0
+    def read(self, n=-1):
+        if n is None or n < 0:
+            chunk, self._body = self._body[self._pos:], b""
+            self._pos = 0
+            return chunk
+        chunk = self._body[self._pos:self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
+
+def _socks5_fetch(req, ctx, timeout):
+    """socks5(h) 兜底：CONNECT 服务器 443 → TLS（同一个 CA ctx 链校验）→ HTTP。"""
+    import socket, ssl as _ssl, io
+    port = _SOCKS_CACHE["port"]
+    ports = (port,) if port else _SOCKS_PORTS
+    last_err = None
+    for pport in ports:
+        try:
+            s = socket.create_connection(("127.0.0.1", pport), timeout=6)
+            s.settimeout(timeout)
+            s.sendall(b"\x05\x01\x00")                       # 无鉴名握手
+            if s.recv(2) != b"\x05\x00":
+                s.close(); continue
+            s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(_CLOUD_HOST)
+                      + _CLOUD_PORT.to_bytes(2, "big"))
+            r = b""
+            while len(r) < 10:
+                c = s.recv(10 - len(r))
+                if not c:
+                    raise OSError("socks5 应答截断")
+                r += c
+            if r[1] != 0:
+                s.close(); continue
+            tls = ctx.wrap_socket(s, server_hostname=_CLOUD_HOST)
+            try:
+                # full_url 形如 https://host:443/pojia/fetch → /pojia/fetch
+                path = "/" + req.full_url.split("/", 3)[3]
+            except Exception:
+                path = "/pojia/fetch"
+            data = req.data or b""
+            hdr = ["%s %s HTTP/1.1" % (req.get_method(), path),
+                   "Host: %s:%d" % (_CLOUD_HOST, _CLOUD_PORT),
+                   "Connection: close"]
+            for k, v in req.header_items():
+                hdr.append("%s: %s" % (k, v))
+            hdr.append("Content-Length: %d" % len(data))
+            tls.sendall("\r\n".join(hdr).encode() + b"\r\n\r\n" + data)
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                c = tls.recv(65536)
+                if not c:
+                    break
+                buf += c
+            if b"\r\n\r\n" not in buf:
+                tls.close(); raise OSError("HTTP 应答截断")
+            head, body = buf.split(b"\r\n\r\n", 1)
+            lines = head.decode("latin-1").split("\r\n")
+            code = int(lines[0].split()[1])
+            hlines = lines[1:]
+            clen = 0
+            for l in hlines:
+                if l.lower().startswith("content-length:"):
+                    clen = int(l.split(":", 1)[1].strip())
+            while len(body) < clen:
+                c = tls.recv(65536)
+                if not c:
+                    break
+                body += c
+            tls.close()
+            _SOCKS_CACHE["port"] = pport
+            if 400 <= code < 600:
+                import urllib.request as _u0, email.message
+                hmsg = email.message.Message()
+                for l in hlines:
+                    if ":" in l:
+                        k, v = l.split(":", 1); hmsg[k.strip()] = v.strip()
+                raise _u0.HTTPError(req.full_url, code, lines[0], hmsg, io.BytesIO(body))
+            return _CloudResp(hlines, body)
+        except OSError as e:
+            last_err = e
+            continue
+    raise last_err or OSError("socks5 兜底全部失败")
+
+def _cloud_open(req, timeout, ctx):
+    """云请求统一入口：直连优先，被阻断（网络层异常）自动走本地 socks5。"""
+    import urllib.request as _ur
+    try:
+        return _ur.urlopen(req, timeout=timeout, context=ctx)
+    except _ur.HTTPError:
+        raise                                  # 4xx/5xx 是正常业务应答，原样抛
+    except Exception as e:                     # 其余 = 网络层失败（TLS EOF/拒绝/DNS）
+        try:
+            return _socks5_fetch(req, ctx, timeout)
+        except Exception:
+            raise e from None                  # 兜底也失败 → 报原始直连错误
 _CLOUD_MSG = {
     "NET":    "连不上官方服务器，请检查网络后重试",
     "PIN":    "安全校验失败（证书指纹不匹配），可能被劫持",
@@ -72,6 +188,10 @@ _CLOUD_MSG = {
     "EXPIRED": "响应已过期，请重试",
     "BANNED": "尝试次数过多，本机已被临时限制 —— 约半小时后自动解除，请稍等再试",
     "SERVER": "服务器内部错误，请稍后重试",
+    # v8.8 一机一码（v8.9 文案对接发码官网）
+    "NEEDCODE": "本机是第一次使用 —— 点下方「去官网领码」，进官网用 QQ 免费领取激活码后填入再验证",
+    "BADCODE":  "激活码不正确，请核对后重输（格式 PJ-XXXX-XXXX-XXXX，去官网领取）",
+    "USEDCODE": "这个激活码已在另一台电脑上绑定 —— 一码只认一台机器，换机去官网登录找群主解绑",
 }
 
 
@@ -80,6 +200,10 @@ class CloudError(Exception):
 
 # v8.6：服务端临时封禁的剩余秒数（_cloud_fetch 捕获，_cloud_verify 展示用）
 _BAN_RETRY = [0]
+# v8.8 一机一码：服务器带回来的错误文案（need/bad/used 时显示）
+_CODE_MSG = [""]
+# v8.9 云端开关：服务器 version.json 的 code_gate（False → 隐藏激活码输入框）
+_CODE_GATE = [True]
 
 
 
@@ -130,7 +254,7 @@ def _cloud_osver():
             return sys.platform
 
 
-def _cloud_fetch(group, ver="", timeout=25):
+def _cloud_fetch(group, ver="", timeout=25, code=""):
     # ver 留空 → 运行时取 DISPLAY_VER（定义顺序在后面，不能当默认参数）
     ver = ver or DISPLAY_VER
     """v3 云握手（纯标准库）。成功返回核心源码 bytes，失败抛 CloudError(code)。
@@ -148,6 +272,7 @@ def _cloud_fetch(group, ver="", timeout=25):
     ts = int(time.time())
     payload = json.dumps({"hwid": hw, "group": group, "ver": ver,
                           "osv": _cloud_osver(),
+                          "code": code or _cloud_saved_code(),  # v8.8 一机一码
                           "nonce": nonce, "ts": ts}).encode()
 
     cafile = os.path.join(getattr(sys, "_MEIPASS", "") or HERE, "ca.pem")
@@ -159,7 +284,7 @@ def _cloud_fetch(group, ver="", timeout=25):
                           headers={"Content-Type": "application/json",
                                    "User-Agent": "pojia-gui/" + ver})
         try:
-            with _ur.urlopen(req, timeout=timeout, context=ctx) as resp:
+            with _cloud_open(req, timeout, ctx) as resp:
                 ctype = resp.headers.get("Content-Type", "")
                 body = resp.read()
         except _ur.HTTPError as he:      # 4xx/5xx 应答体是 JSON 错误信息
@@ -197,6 +322,16 @@ def _cloud_fetch(group, ver="", timeout=25):
             raise CloudError("BANNED")
         if err == "slow down":
             raise CloudError("NET")
+        # v8.8 一机一码：服务器 err 分流（老服务器不回这些，天然兼容）
+        if err == "need code":
+            _CODE_MSG[0] = str(r.get("msg") or "")[:300]
+            raise CloudError("NEEDCODE")
+        if err == "code bad":
+            _CODE_MSG[0] = str(r.get("msg") or "")[:300]
+            raise CloudError("BADCODE")
+        if err == "code used":
+            _CODE_MSG[0] = str(r.get("msg") or "")[:300]
+            raise CloudError("USEDCODE")
         raise CloudError("SERVER")
 
     # 二进制帧：hmac(32) | sha256(core)(32) | len(4) | core
@@ -226,6 +361,8 @@ _CLOUD_STATE = {"state": "local"}          # local=本地核心模式，无需�
 _CLOUD_GROUP_FILE = os.path.join(
     os.environ.get("LOCALAPPDATA") or HERE, "破甲一键通", "cloud.json")
 _CLOUD_LOCK = threading.Lock()
+_CLOUD_WATCHDOG_STARTED = False
+_CLOUD_RECHECK_MINUTES = (0, 30)
 
 
 def _cloud_saved_group():
@@ -234,6 +371,31 @@ def _cloud_saved_group():
         return json.load(open(_CLOUD_GROUP_FILE, encoding="utf-8")).get("group", "")
     except Exception:
         return ""
+
+
+def _cloud_saved_code():
+    """v8.8 一机一码：本机存档的激活码（cloud.json 的 code 字段）。"""
+    try:
+        return str(json.load(open(_CLOUD_GROUP_FILE, encoding="utf-8"))
+                   .get("code", "") or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _cloud_save_code(code):
+    """v8.8：用户在界面填了激活码 → 原子写进 cloud.json（空值也写，表示清空）。"""
+    try:
+        try:
+            d = json.load(open(_CLOUD_GROUP_FILE, encoding="utf-8"))
+        except Exception:
+            d = {}
+        d["code"] = str(code or "").strip().upper()[:24]
+        tmp = _CLOUD_GROUP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(d, ensure_ascii=False))
+        os.replace(tmp, _CLOUD_GROUP_FILE)
+    except Exception:
+        pass
 
 
 def _cloud_today_ok():
@@ -263,6 +425,52 @@ def _cloud_mark_ok(group):
         pass
 
 
+def _cloud_watchdog_stop(message):
+    """v8.12：半点校验失败时阻断当前进程。"""
+    _CLOUD_STATE["state"] = "error:NET"
+    _CLOUD_STATE["msg"] = message
+    _push_log("[云校验] " + message + " —— 进程终止")
+    _fatal_box("云端校验失败，程序即将退出。\\n\\n" + message)
+    os._exit(2)
+
+
+def _cloud_watchdog_loop():
+    """v8.12：在本地时钟每个整点/半点重新握手；失败立即终止进程。"""
+    last_slot = None
+    while True:
+        now = time.localtime()
+        slot = (now.tm_year, now.tm_yday, now.tm_hour, now.tm_min // 30)
+        if now.tm_min in _CLOUD_RECHECK_MINUTES and slot != last_slot:
+            last_slot = slot
+            try:
+                group = _cloud_saved_group()
+                code = _cloud_saved_code()
+                if not group or not code:
+                    _cloud_watchdog_stop("本机激活信息缺失，请重新登录")
+                try:
+                    _cloud_fetch(group, DISPLAY_VER, timeout=25, code=code)
+                except CloudError as exc:
+                    _cloud_watchdog_stop("服务器拒绝本机校验（%s）" % exc)
+                except BaseException as exc:
+                    _cloud_watchdog_stop("无法连接服务器：%s" % type(exc).__name__)
+                _push_log("[云校验] %02d:%02d 校验通过" % (now.tm_hour, now.tm_min))
+            except SystemExit:
+                raise
+            except BaseException as exc:
+                _cloud_watchdog_stop("无法连接服务器：%s" % type(exc).__name__)
+        time.sleep(1)
+
+
+def _cloud_watchdog_start():
+    """v8.12：启动半点云校验守护线程，仅云模式启用。"""
+    global _CLOUD_WATCHDOG_STARTED
+    if _CLOUD_WATCHDOG_STARTED or not CLOUD_MODE:
+        return
+    _CLOUD_WATCHDOG_STARTED = True
+    threading.Thread(target=_cloud_watchdog_loop, daemon=True,
+                     name="cloud-half-hour-watchdog").start()
+
+
 # ---------------------------------------------------------------- 定位并加载核心
 def _find_core():
     """先找 exe/脚本旁边的核心（文件名含「一键通」的 .py）；
@@ -289,9 +497,38 @@ if CLOUD_MODE:
     _CLOUD_STATE["state"] = "loading" if _cloud_today_ok() else "wait_group"
 
 
+def _code_gate_fetch():
+    """v8.9：启动即拉一次 /pojia/version 只取 code_gate（云端开关：
+    0 = 隐藏激活码输入框，用户只填群号）。不做版本更新逻辑，失败静默
+    （保持默认显示输入框）。"""
+    try:
+        import ssl as _ssl
+        import urllib.request as _ur
+        cafile = os.path.join(getattr(sys, "_MEIPASS", "") or HERE, "ca.pem")
+        ctx = _ssl.create_default_context(cafile=cafile) if os.path.isfile(cafile) \
+            else _ssl._create_unverified_context()
+        req = _ur.Request(
+            "https://%s:%s/pojia/version" % (_CLOUD_HOST, _CLOUD_PORT),
+            headers={"User-Agent": "pojia-gui/" + VERSION})
+        with _cloud_open(req, 8, ctx) as resp:
+            r = json.loads(resp.read().decode("utf-8", "replace"))
+        g = r.get("code_gate")
+        if g is not None:
+            _CODE_GATE[0] = bool(g)
+    except Exception:
+        pass
+
+
+if CLOUD_MODE:
+    threading.Thread(target=_code_gate_fetch, daemon=True,
+                      name="code-gate").start()   # 弹窗前就位：隐藏/显示激活码框
+
+
 # v8.5：核心改为后台线程加载 —— 窗口先弹出来，封印自检 / 类初始化在后台跑完
 # 再放行 API。启动体感快一截。核心没就绪时，所有接口返回「加载中」占位。
-DISPLAY_VER = "8.7"              # GUI 显示版本（核心 VERSION 以封印文件为准）
+DISPLAY_VER = "8.12"             # GUI 显示版本（核心 VERSION 以封印文件为准）
+# 2026-10-12：8.11 即当前发布版。更新弹窗统一跳转 GitHub Releases，
+# 服务器 version.json min_ver=8.11 会强制旧客户端更新，更新入口统一为 GitHub Releases。
 core = None
 PERSONA_FILE = ""
 VERSION = DISPLAY_VER
@@ -375,9 +612,11 @@ def _core_wire(c, label):
               % (VERSION, label, time.time() - _CORE_T0))
 
 
-def _cloud_verify(group):
+def _cloud_verify(group, code="", force=False):
     """云验证：握手 → 拉核心 → 构建 + 接线。成功 (True,"")，失败 (False,errcode)。
-    POST /api/cloud/verify 与启动自动验证共用。"""
+    POST /api/cloud/verify 与启动自动验证共用。
+    v8.12：激活码改为「验证通过才存档」（v8.11 曾在提交时即存，
+    错码落盘 → 重开软件自动预填错码 → 死循环无法修改）。"""
     global core
     with _CLOUD_LOCK:
         if core is not None:
@@ -385,7 +624,7 @@ def _cloud_verify(group):
         _CLOUD_STATE["state"] = "loading"
         _CLOUD_STATE["msg"] = ""
         try:
-            src = _cloud_fetch(group)
+            src = _cloud_fetch(group, code=code)
         except CloudError as e:
             code = str(e)
             _CLOUD_STATE["state"] = "error:" + code
@@ -403,6 +642,12 @@ def _cloud_verify(group):
                 msg = ("尝试次数过多，本机已被临时限制 —— 约 %d 分钟后自动解除"
                        "（到点直接重试即可），请稍等再试" % mins)
                 _BAN_RETRY[0] = 0
+            # v8.8 一机一码：本机未激活 → 回到输入界面（优先用服务器文案）
+            if code in ("NEEDCODE", "BADCODE", "USEDCODE"):
+                if _CODE_MSG[0]:
+                    msg = _CODE_MSG[0]
+                _CODE_MSG[0] = ""
+                _CLOUD_STATE["state"] = "wait_code"    # 保留群号，直接回激活码输入
             _CLOUD_STATE["msg"] = msg
             return False, code
         except Exception as e:               # 网络栈异常等环境问题
@@ -431,6 +676,10 @@ def _cloud_verify(group):
         _notice_async()               # v8.6：云验证通过 → 拉云公告弹窗
         _update_async()               # v8.7：云验证通过 → 校验版本（强制更新）
         _cloud_mark_ok(group)         # v8.7：记今天已验证（次日需重新输入）
+        _cloud_watchdog_start()       # v8.12：启动整点/半点云校验守护
+        # v8.12：验证通过才存档激活码（错码永不落盘，重开不会预填错码）
+        if code:
+            _cloud_save_code(code)
         return True, ""
 
 
@@ -480,7 +729,7 @@ def _update_check(interactive=False):
     req = _ur.Request("https://%s:%d/pojia/version"
                       % (_CLOUD_HOST, _CLOUD_PORT),
                       headers={"User-Agent": "pojia-gui/" + VERSION})
-    with _ur.urlopen(req, timeout=12, context=ctx) as resp:
+    with _cloud_open(req, 12, ctx) as resp:
         r = json.loads(resp.read().decode("utf-8", "replace"))
     if not r.get("ok"):
         if interactive:
@@ -492,6 +741,18 @@ def _update_check(interactive=False):
     url = str(r.get("url") or "").strip()
     note = str(r.get("note") or "").strip()
     force_flag = bool(r.get("force"))
+    # v8.12：服务器下发半点校验规则；当前支持每小时整点/半点（30 分钟）
+    global _CLOUD_RECHECK_MINUTES
+    try:
+        interval = int(r.get("recheck_minutes") or 30)
+        _CLOUD_RECHECK_MINUTES = (0, 30) if interval == 30 else (0, 0)
+    except (TypeError, ValueError):
+        _CLOUD_RECHECK_MINUTES = (0, 30)
+    # v8.9 云端开关：服务器 code_gate=0 → 隐藏激活码输入框（用户只填群号）
+    gate = r.get("code_gate")
+    if gate is not None:
+        _CODE_GATE[0] = bool(gate)
+        _push_log("[更新] 激活码输入框（云端开关 code_gate=%s）" % gate)
     _UPD_STATE["latest"] = latest
     _UPD_STATE["url"] = url
     _UPD_STATE["note"] = note
@@ -575,7 +836,7 @@ def _update_inline_work(dest_dir):
                           headers={"User-Agent": "pojia-gui/" + VERSION})
         _push_log("[更新] 开始从官方服务器下载新版：%s" % fname)
         t0 = time.time()
-        with _ur.urlopen(req, timeout=30, context=ctx) as resp:
+        with _cloud_open(req, 30, ctx) as resp:
             total = int(resp.headers.get("Content-Length") or 0)
             done = 0
             next_pct = 10
@@ -694,7 +955,7 @@ def _notice_worker():
         req = _ur.Request("https://%s:%d/pojia/notice"
                           % (_CLOUD_HOST, _CLOUD_PORT),
                           headers={"User-Agent": "pojia-gui/" + VERSION})
-        with _ur.urlopen(req, timeout=12, context=ctx) as resp:
+        with _cloud_open(req, 12, ctx) as resp:
             r = json.loads(resp.read().decode("utf-8", "replace"))
         if not r.get("ok"):
             return
@@ -764,7 +1025,7 @@ def _ad_fetch():
         req = _ur.Request("https://%s:%d/pojia/ad"
                           % (_CLOUD_HOST, _CLOUD_PORT),
                           headers={"User-Agent": "pojia-gui/" + VERSION})
-        with _ur.urlopen(req, timeout=8, context=ctx) as resp:
+        with _cloud_open(req, 8, ctx) as resp:
             r = json.loads(resp.read().decode("utf-8", "replace"))
         if r.get("ok") and r.get("enabled"):
             data = {"ok": True, "enabled": True,
@@ -2153,7 +2414,10 @@ HTML = r"""<!DOCTYPE html>
 <title>破甲一键通</title>
 <style>
 :root{
-  /* ---- 色板（OKLCH，感知均匀；中性色带极轻微 teal 偏移）---- */
+  /* ---- 色板（OKLCH，感知均匀；中性色带极轻微 teal 偏移）----
+     总则：中性色占 ~80%，彩色仅 teal 主色（--ac）+ 语义三色（--ok/--warn/--bad）；
+     实色表面分层做层次（更亮=更高层），不用渐变/毛玻璃/大阴影堆叠；
+     动效 150-250ms 指数缓动，克制跟手。 */
   /* 表面：深色用「更亮 = 更高层」，不用阴影堆叠 */
   --void:  oklch(13.5% 0.006 200);      /* 最底（日志页） */
   --bg:    oklch(16%   0.008 200);      /* 应用背景 */
@@ -2223,14 +2487,12 @@ body[data-p="log"] .app{padding-bottom:34px}
   border-radius:7px;background:var(--ac-bg);border:1px solid oklch(72% .115 192 / .34);
   color:var(--ac);font:700 12px/1 var(--mono)}
 
-/* 玻璃药丸导航 —— 保留液态玻璃，但收窄、去浮夸 */
-.tabs{position:relative;display:flex;padding:4px;margin-left:8px;border-radius:16px;
-  background:linear-gradient(160deg,oklch(38% .012 200 / .34),oklch(24% .010 200 / .30));
-  backdrop-filter:blur(18px) saturate(150%);-webkit-backdrop-filter:blur(18px) saturate(150%);
-  border:1px solid oklch(60% .015 200 / .14);
-  box-shadow:inset 0 1px 0 oklch(96% .01 200 / .10)}
+/* 药丸导航 —— 实色表面分层（去 AI 味：不用毛玻璃/渐变，靠亮度做层次） */
+.tabs{position:relative;display:flex;padding:4px;margin-left:8px;border-radius:12px;
+  background:oklch(21% .010 200);
+  border:1px solid var(--line)}
 #topPill{position:absolute;top:4px;left:0;height:calc(100% - 8px);width:0;border-radius:12px;
-  background:linear-gradient(170deg,oklch(52% .020 200 / .85),oklch(38% .014 200 / .85));
+  background:oklch(40% .016 200 / .9);
   box-shadow:inset 0 1px 0 oklch(96% .01 200 / .22);
   opacity:0;pointer-events:none;
   transition:transform .34s var(--e-out-quart),width .34s var(--e-out-quart),opacity .2s}
@@ -2305,12 +2567,11 @@ button.mini{padding:4px 11px;font-size:12px;border-radius:7px}
 /* ---- 底部操作坞（液态玻璃）---- */
 .dock{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:60;
   display:flex;align-items:center;gap:9px;padding:9px 12px;
-  max-width:min(96vw,920px);border-radius:var(--r-xl);
-  background:linear-gradient(160deg,oklch(40% .013 200 / .48),oklch(25% .010 200 / .42));
-  backdrop-filter:blur(24px) saturate(165%);-webkit-backdrop-filter:blur(24px) saturate(165%);
-  border:1px solid oklch(64% .015 200 / .16);
-  box-shadow:inset 0 1px 0 oklch(96% .01 200 / .16),0 12px 34px oklch(8% .01 200 / .55);
-  transition:transform .36s var(--e-out-quart),opacity .28s}
+  max-width:min(96vw,920px);border-radius:var(--r-lg);
+  background:oklch(22% .011 200);
+  border:1px solid var(--line2);
+  box-shadow:0 6px 20px oklch(8% .01 200 / .45);
+  transition:transform .24s var(--e-out-quart),opacity .2s var(--e-out-quart)}
 body[data-p="log"] .dock{transform:translateX(-50%) translateY(130px);opacity:0;pointer-events:none}
 .dsep{width:1px;height:22px;background:oklch(64% .015 200 / .18);flex:none}
 .dock .ck{color:var(--tx2);flex:none}
@@ -2324,10 +2585,10 @@ body[data-p="log"] .dock{transform:translateX(-50%) translateY(130px);opacity:0;
 .dbtn:active:not(:disabled){transform:scale(.94)}
 .dbtn:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
 .dbtn:disabled{opacity:.4;cursor:not-allowed}
-.dbtn.primary{background:linear-gradient(160deg,oklch(76% .115 192),oklch(63% .105 192));
+.dbtn.primary{background:oklch(72% .115 192);
   color:oklch(18% .02 200);font-weight:650;border-color:oklch(80% .10 192 / .5);
-  box-shadow:inset 0 1px 0 oklch(96% .02 192 / .4),0 3px 15px oklch(72% .115 192 / .28)}
-.dbtn.primary:hover:not(:disabled){background:linear-gradient(160deg,oklch(80% .12 192),oklch(67% .11 192))}
+  box-shadow:0 2px 10px oklch(72% .115 192 / .22)}
+.dbtn.primary:hover:not(:disabled){background:oklch(78% .12 192)}
 .dbtn.danger{color:oklch(76% .14 25);background:oklch(66% .165 25 / .14);
   border-color:oklch(66% .165 25 / .34)}
 .dbtn.danger:hover:not(:disabled){background:oklch(66% .165 25 / .24)}
@@ -2472,31 +2733,31 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
   border:3px solid transparent;background-clip:padding-box}
 ::-webkit-scrollbar-thumb:hover{background:oklch(42% .014 200);background-clip:padding-box}
 ::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
-.logbox .ln{color:oklch(76% .008 200)}
+.logbox .ln{color:oklch(76% .008 200);content-visibility:auto;contain-intrinsic-size:auto 22px}
 .logbox .ln.err{color:var(--bad)}
 .passcard{background:var(--card);border:1px solid var(--line);border-radius:var(--r-md);
   padding:13px 17px;margin-top:13px;font-size:12.5px;color:var(--tx2)}
 .passcard code{font-family:var(--mono);color:var(--warn);
   background:oklch(78% .125 78 / .09);padding:2px 8px;border-radius:6px}
 .toast{position:fixed;left:50%;bottom:100px;transform:translateX(-50%) translateY(16px);
-  background:oklch(30% .014 200 / .96);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  background:oklch(30% .014 200);
   border:1px solid var(--line2);color:var(--tx);
   padding:10px 19px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;
-  transition:opacity .22s var(--e-out-quart),transform .22s var(--e-out-quart);
-  box-shadow:0 10px 34px oklch(8% .01 200 / .6);z-index:99}
+  transition:opacity .2s var(--e-out-quart),transform .2s var(--e-out-quart);
+  box-shadow:0 8px 24px oklch(8% .01 200 / .5);z-index:99}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 
 /* ---- 浮层（启动验证 / 加入 / 捐赠 / 更新）---- */
 .veil{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;
-  background:oklch(9% .008 200 / .7);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
-  opacity:0;pointer-events:none;transition:opacity .28s var(--e-out-quart)}
+  background:oklch(9% .008 200 / .78);
+  opacity:0;pointer-events:none;transition:opacity .22s var(--e-out-quart)}
 .veil.show{opacity:1;pointer-events:auto}
 .vcard{width:430px;max-width:90vw;padding:32px 32px 24px;border-radius:var(--r-lg);text-align:center;
-  background:linear-gradient(165deg,oklch(26% .012 200 / .98),oklch(18% .009 200 / .98));
-  border:1px solid oklch(64% .015 200 / .16);
-  box-shadow:0 26px 74px oklch(6% .01 200 / .66);
+  background:oklch(22% .011 200);
+  border:1px solid var(--line2);
+  box-shadow:0 12px 36px oklch(6% .01 200 / .55);
   transform:translateY(14px) scale(.965);
-  transition:transform .36s var(--e-out-quart)}
+  transition:transform .22s var(--e-out-quart)}
 .veil.show .vcard{transform:none}
 .vbadge{display:inline-block;padding:3px 14px;border-radius:20px;font-size:11px;letter-spacing:1.6px;
   background:var(--ac-bg);border:1px solid oklch(72% .115 192 / .4);
@@ -2694,15 +2955,22 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
     <div class="vbadge">破甲一键通 · 云端版</div>
     <div class="vtitle">身份验证</div>
     <div class="vfree">本软件完全免费 · 打开需要验证官方 QQ 群号</div>
-    <div class="cbox" id="cbox-form">
+    <div class="cbox" id="cbox-form" style="flex-direction:column;gap:8px">
       <input class="cinput" id="cloudgroup" inputmode="numeric"
              placeholder="输入 QQ 群号" maxlength="12" autocomplete="off"
              spellcheck="false">
+      <input class="cinput" id="cloudcode"
+             placeholder="激活码（老用户不用填）" maxlength="16"
+             autocomplete="off" spellcheck="false"
+             style="text-transform:uppercase">
       <button class="dbtn primary" id="b-cloudgo">验 证</button>
+      <div id="codeweb-link" style="margin-top:10px;font-size:12px;color:var(--tx2);
+           cursor:pointer;text-align:center;line-height:1.5"
+           title="在浏览器打开官网，用 QQ 免费领取激活码">没有激活码？<b style="color:var(--ok)">去官网领码 →</b></div>
     </div>
     <div class="cstat" id="cloudstat">正在连接官方服务器…</div>
     <div class="vfoot">核心经 TLS 加密通道 + 数字签名从官方服务器下发，不落盘<br>
-      群号在官方 QQ 群的群公告里 · 输错可重试，设备可被官方吊销</div>
+      没有激活码？点「去官网领码」用 QQ 免费领取 · 群号在官方 QQ 群的群公告里</div>
   </div>
 </div>
 <div class="veil" id="joinveil">
@@ -2771,10 +3039,9 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
          color:#aab0bd;white-space:pre-wrap;text-align:left;max-height:32vh;overflow:auto"></div>
     <div class="vbtns">
       <button class="dbtn" id="b-upd-skip" style="display:none">稍后再说</button>
-      <button class="dbtn" id="b-upd-inline" style="display:none">在线更新</button>
-      <button class="dbtn primary" id="b-upd-go">浏览器更新</button>
+      <button class="dbtn primary" id="b-upd-go">前往下载</button>
     </div>
-    <div class="vfoot" id="upd-foot">点「立即更新」前往官方下载页（完全免费）</div>
+    <div class="vfoot" id="upd-foot">点击前往 GitHub Releases 下载新版（完全免费）</div>
   </div>
 </div>
 
@@ -3102,7 +3369,7 @@ async function pullLog(){
       d.textContent=ln;box.appendChild(d);
     });
     LOGNEXT=j.next;
-    while(box.childNodes.length>3000)box.removeChild(box.firstChild);
+    while(box.childNodes.length>800)box.removeChild(box.firstChild);
     if(atBottom||$("#autoscroll").checked)box.scrollTop=box.scrollHeight;
   }catch(e){}
 }
@@ -3130,6 +3397,9 @@ function openExt(u){           // 优先 pywebview 桥（Python 开系统浏览�
 }
 function joinQQ(){toast("浏览器打开加群页，进群后看群公告拿群号…");openExt(QQ_LINK);}
 function joinTG(){toast("打开 TG 频道…");openExt(TG_LINK);}
+/* v8.10：发码官网（自助领激活码）—— 8080 被机房拦未备案明文 HTTP，并入 443 TLS（/codeweb） */
+const CODEWEB_LINK="https://103.212.186.16/codeweb/";
+function openCodeWeb(){toast("浏览器打开发码官网，用 QQ 免费领取激活码…");openExt(CODEWEB_LINK);}
 
 /* ---- 云下发公告弹窗（v8.6；v3.9 支持图片）：Python 在云验证通过后 evaluate_js 调这里 ---- */
 function showCloudNotice(title,text,image,link){
@@ -3140,7 +3410,7 @@ function showCloudNotice(title,text,image,link){
       +"display:none;align-items:center;justify-content:center;";
     veil.innerHTML='<div style="max-width:560px;width:88%;max-height:88vh;overflow:auto;'
       +'background:#1d1f24;border:1px solid #3a3f4b;border-radius:14px;padding:26px 28px;'
-      +'box-shadow:0 18px 60px rgba(0,0,0,.55);">'
+      +'box-shadow:0 10px 32px rgba(0,0,0,.5);">'
       +'<div id="nt-title" style="font-size:17px;font-weight:700;color:#e8eaf0;'
       +'margin-bottom:12px;"></div>'
       +'<img id="nt-img" alt="" style="display:none;width:100%;border-radius:10px;'
@@ -3182,11 +3452,9 @@ function showUpdate(u){
   $("#upd-note").style.display=(u.note?"block":"none");
   const skip=$("#b-upd-skip");
   skip.style.display=force?"none":"inline-block";   // 强制更新不给跳过
-  // v8.7：在线更新按钮仅在强制更新时出现（普通提示走浏览器更新即可）
-  $("#b-upd-inline").style.display=force?"inline-block":"none";
   $("#upd-foot").textContent=force
-    ? "旧版本已停止服务，必须更新后才能继续使用（完全免费）"
-    : "点「立即更新」前往官方下载页（完全免费）";
+    ? "旧版本已停止服务，请前往 GitHub Releases 下载新版后使用（完全免费）"
+    : "点击前往 GitHub Releases 下载新版（完全免费）";
   const veil=$("#updateveil");veil.classList.add("show");
   veil.dataset.force=force?"1":"0";
 }
@@ -3195,26 +3463,7 @@ $("#b-upd-go").onclick=()=>{
   openExt(u||"https://github.com/z91772524-ai/pojia-next/releases");
   if($("#updateveil").dataset.force==="1") toast("请下载新版后重新打开（当前窗口仍可查看日志）");
 };
-/* v8.7 在线更新：选保存目录 → 服务器静默下载 zip → 完成打开所在文件夹 */
-$("#b-upd-inline").onclick=async()=>{
-  const btn=$("#b-upd-inline");
-  btn.disabled=true;btn.textContent="正在准备…";
-  try{
-    const r=await fetch("/api/update/inline",{method:"POST"});
-    const j=await r.json();
-    if(j&&j.ok){
-      btn.textContent="已开始后台下载";
-      $("#upd-line").textContent="正在后台下载新版…完成后自动打开所在文件夹";
-      toast("已开始下载，请看界面日志里的进度");
-    }else{
-      btn.disabled=false;btn.textContent="在线更新";
-      toast("在线更新不可用："+(j&&j.msg||"未知原因")+"，可用「浏览器更新」");
-    }
-  }catch(e){
-    btn.disabled=false;btn.textContent="在线更新";
-    toast("在线更新启动失败，可用「浏览器更新」");
-  }
-};
+/* v8.7.1：更新交互简化——检测到新版本只跳 GitHub，在线更新入口已移除 */
 $("#b-upd-skip").onclick=()=>{$("#updateveil").classList.remove("show");toast("已跳过，可稍后更新");};
 
 /* ---- 捐赠弹窗（v8.7）：两选一，「去捐赠」展示收款码 ---- */
@@ -3257,6 +3506,7 @@ document.addEventListener("click",e=>{
 
 function hideVeils(){$("#joinveil").classList.remove("show");$("#pickveil").classList.remove("show");}
 $("#vl-qq").onclick=joinQQ;
+$("#codeweb-link").onclick=openCodeWeb;
 $("#vl-tg").onclick=joinTG;
 $("#b-joinus").onclick=showPickVeil;
 $("#b-pickqq").onclick=()=>{hideVeils();joinQQ();};
@@ -3350,14 +3600,31 @@ function cloudUI(show, stat, isErr, spin, showInput){
   el.className="cstat"+(isErr?" err":"");
   el.innerHTML=(spin?'<span class="cspin"></span>':"")+stat;
 }
+/* v8.9：云端 code_gate 开关 — gate=0 隐藏激活码框 + 领码链接（用户只填群号）
+   v8.11：激活码只输一次 — 存档码自动预填，之后每次验证自动带上 */
+function cloudGate(gate, saved){
+  const cw=$("#cloudcode"), lk=$("#codeweb-link");
+  if(!cw||!lk)return;
+  cw.style.display=gate?"":"none";
+  lk.style.display=gate?"":"none";
+  if(gate&&saved){                        /* v8.11：预填已绑定码 + 提示语 */
+    cw.value=saved;
+    cw.placeholder="已自动填入本机激活码（输错可直接改，点登录重试）";  /* v8.12 */
+  }
+}
 async function cloudPoll(){
   try{
     const r=await fetch("/api/cloud/state");const s=await r.json();
     if(s.mode!=="cloud"){cloudDone();return;}
     if(s.state==="ok"){cloudDone();return;}
     if(s.state==="wait_group"){
-      cloudUI(true,"等待输入群号 — 输官方 QQ 交流群号",false,false,true);
+      cloudUI(true, s.msg || "等待输入群号 — 输官方 QQ 交流群号",false,false,true);
+      cloudGate(s.gate!==false, s.saved_code); /* v8.11：显隐 + 预填存档激活码 */
       $("#cloudgroup").focus();
+    }else if(s.state==="wait_code"){
+      cloudUI(true, s.msg || "请输入激活码后重试",true,false,true);
+      cloudGate(true, s.saved_code);
+      $("#cloudcode").focus();
     }else if(s.state==="loading"){
       cloudUI(true,"正在验证并从官方服务器拉取核心…",false,true,false);
     }else if(s.state.startsWith("error:")){
@@ -3381,18 +3648,23 @@ function cloudGo(){
   if(!/^\d{5,12}$/.test(g)){cloudUI(true,"请输入 5~12 位数字的群号",true,false,true);
     $("#cloudgroup").classList.add("err");
     setTimeout(()=>$("#cloudgroup").classList.remove("err"),600);return;}
+  const c=$("#cloudcode").value.trim();          // v8.8 一机一码（可空）
   cloudUI(true,"正在验证…",false,true,false);
   fetch("/api/cloud/verify",{method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({group:g})}).catch(()=>{});
+    body:JSON.stringify({group:g, code:c})}).catch(()=>{});
 }
 $("#b-cloudgo").onclick=cloudGo;
 $("#cloudgroup").addEventListener("keydown",e=>{if(e.key==="Enter")cloudGo();});
+$("#cloudcode").addEventListener("keydown",e=>{if(e.key==="Enter")cloudGo();});
 (async function cloudBoot(){
   try{
     const r=await fetch("/api/cloud/state");const s=await r.json();
     if(s.mode!=="cloud"||s.state==="ok"){appBoot();return;}
-    if(s.state==="wait_group") cloudUI(true,"等待输入群号 — 输官方 QQ 交流群号",false,false,true);
+    if(s.state==="wait_group"){cloudUI(true,"等待输入群号 — 输官方 QQ 交流群号",false,false,true);
+      cloudGate(s.gate!==false, s.saved_code);}   /* v8.11：boot 时也预填 */
+    else if(s.state==="wait_code"){cloudUI(true,"请输入激活码后重试",true,false,true);
+      cloudGate(true, s.saved_code); $("#cloudcode").focus();}
     else cloudUI(true,"正在验证并从官方服务器拉取核心…",false,true,false);
     CLOUD_TIMER=setInterval(cloudPoll,900);
     cloudPoll();
@@ -3435,6 +3707,9 @@ class Handler(BaseHTTPRequestHandler):
                     "state": _CLOUD_STATE["state"],
                     "msg": _CLOUD_STATE.get("msg", ""),
                     "group_saved": bool(_cloud_saved_group()),
+                    "gate": bool(_CODE_GATE[0]),   # v8.9：云端开关控制激活码框显隐
+                    # v8.11：本机存档的激活码 —— 前端预填（输一次，以后自动带）
+                    "saved_code": _cloud_saved_code() or "",
                 })
         if self.path.startswith("/api/state"):
             fresh = ("fresh=1" in self.path)
@@ -3499,8 +3774,10 @@ class Handler(BaseHTTPRequestHandler):
             if not group.isdigit() or len(group) < 5:
                 return self._json({"ok": False, "err": "GROUP",
                                    "msg": _CLOUD_MSG["GROUP"]})
+            # v8.12：错码不再落盘——码传给验证线程，成功后才存档（v8.11 先存后验是死循环之源）
+            _c = str(req.get("code") or "")
             # 验证 + 拉核心可能要几秒，放后台，前端轮询 /api/cloud/state
-            threading.Thread(target=_cloud_verify, args=(group,),
+            threading.Thread(target=_cloud_verify, args=(group, _c),
                              daemon=True, name="cloud-verify").start()
             return self._json({"ok": True, "started": True})
 
@@ -3593,7 +3870,8 @@ def main():
     # v8.7：今天已验证过（每日免输）→ 自动用存档群号云验证，
     # 前端轮询到 loading 显示「正在验证…」，成功后提示「登录成功」。
     if CLOUD_MODE and _CLOUD_STATE["state"] == "loading":
-        threading.Thread(target=_cloud_verify, args=(_cloud_saved_group(),),
+        threading.Thread(target=_cloud_verify,
+                         args=(_cloud_saved_group(), _cloud_saved_code() or ""),
                          daemon=True, name="cloud-auto").start()
 
     def _port_busy(p):
