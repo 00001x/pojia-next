@@ -45,11 +45,55 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
+# v8.14 加固：敏感字符串 XOR 混淆（避免明文落在 pyd 二进制里被直接 grep）
+_XOR_KEY = b"pojia-xor-2026-harden"
+
+def _obf_decode(enc, key=_XOR_KEY):
+    """XOR 对称解码：入参 bytes，返回 bytes。混淆非加密，仅提升静态提取门槛。"""
+    b = enc if isinstance(enc, (bytes, bytearray)) else bytes(enc)
+    k = key if isinstance(key, (bytes, bytearray)) else key.encode()
+    return bytes(c ^ k[i % len(k)] for i, c in enumerate(b))
+
+
 def _fatal_box(msg):
     """无控制台 exe 里启动失败时的最后手段：弹个 Windows 消息框。"""
     try:
         import ctypes
         ctypes.windll.user32.MessageBoxW(None, msg, "破甲一键通 GUI", 0x10)
+    except Exception:
+        pass
+
+
+# v8.14 加固：启动期反调试 + 资源完整性校验（不依赖云验证，先于窗口启动）。
+# ca.pem 是 TLS 校验根，哈希固定且随包分发；被替换即 MITM 风险，必须 fail-closed。
+_CA_PEM_SHA256 = "e738afdbc22016c46c0574c4270e201fddfdd7ba694d8e24ec00973bc0312332"
+
+def _hardening_startup_check():
+    """反调试 + 资源完整性。仅在打包后（frozen）强制，dev 跑不拦。"""
+    if not getattr(sys, "frozen", False):
+        return
+    # ① 反调试：被调试器附着则拒绝运行（不影响正常粘贴/云验证）
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        if k32.IsDebuggerPresent():
+            _fatal_box("检测到调试器，已安全退出。")
+            raise SystemExit(7)
+        present = ctypes.c_bool(False)
+        if k32.CheckRemoteDebuggerPresent(-1, ctypes.byref(present)) and present.value:
+            _fatal_box("检测到调试器，已安全退出。")
+            raise SystemExit(7)
+    except Exception:
+        pass
+    # ② 资源完整性：校验内置 ca.pem 未被替换
+    try:
+        import hashlib
+        cafile = os.path.join(getattr(sys, "_MEIPASS", "") or HERE, "ca.pem")
+        if os.path.exists(cafile):
+            h = hashlib.sha256(open(cafile, "rb").read()).hexdigest()
+            if h != _CA_PEM_SHA256:
+                _fatal_box("内置资源校验失败（ca.pem 不匹配），已安全退出。")
+                raise SystemExit(8)
     except Exception:
         pass
 
@@ -61,7 +105,8 @@ else:
 
 # ------------------------------------------- 云端核心下发（v8.5 加密版·协议 v2）
 # exe 空壳化：核心脚本不进 exe，启动时从官方服务器拉取。
-_CLOUD_HOST = "103.212.186.16"
+# v8.14 加固：云主机 IP 不再明文（XOR 混淆），解码在运行时完成。
+_CLOUD_HOST = _obf_decode(bytes.fromhex("415f5947531c4a414315041e0300"), _XOR_KEY).decode()
 _CLOUD_PORT = 443
 
 # v8.8.1：直连被阻断时的本地 socks5 兜底（纯标准库手搓，零依赖）。
@@ -350,7 +395,9 @@ def _cloud_fetch(group, ver="", timeout=25, code=""):
 
     # ② HMAC-SHA256 认证：sig 覆盖 hwid|group|sha256(core)|nonce|ts
     msg = "|".join([hw, group, core_sha, nonce, str(ts)]).encode("utf-8")
-    key = hashlib.sha256(b"pojia-cloud-hmac-v3|34839810|key").digest()
+    # v8.14 加固：HMAC 密钥不再明文（XOR 混淆）
+    key = hashlib.sha256(_obf_decode(bytes.fromhex(
+        "0000000000001b031d58561d5a5b4c0b4c0457195d44575950591c481319484b"), _XOR_KEY)).digest()
     import hmac as _hm
     if not _hm.compare_digest(_hm.new(key, msg, "sha256").digest(), sig):
         raise CloudError("SIG")
@@ -526,7 +573,7 @@ if CLOUD_MODE:
 
 # v8.5：核心改为后台线程加载 —— 窗口先弹出来，封印自检 / 类初始化在后台跑完
 # 再放行 API。启动体感快一截。核心没就绪时，所有接口返回「加载中」占位。
-DISPLAY_VER = "8.13"             # GUI 显示版本（核心 VERSION 以封印文件为准）
+DISPLAY_VER = "8.14"             # GUI 显示版本（核心 VERSION 以封印文件为准）
 # 2026-10-12：8.11 即当前发布版。更新弹窗统一跳转 GitHub Releases，
 # 服务器 version.json min_ver=8.11 会强制旧客户端更新，更新入口统一为 GitHub Releases。
 core = None
@@ -1601,6 +1648,7 @@ def _detect_java():
                 r"C:\Program Files (x86)\Java\*\bin\java.exe"):
         cands += glob.glob(pat)
     seen = set()
+    jre_cand = None          # 第一只找到 JRE（无 javac）时兜底
     for c in cands:
         nc = os.path.normcase(c)
         if nc in seen:
@@ -1610,14 +1658,25 @@ def _detect_java():
             continue
         rc, out = _env_run([c, "-version"])
         m = re.search(r'"([^"]+)"', out)
+        ver = m.group(1) if m else ""
         home = os.path.dirname(os.path.dirname(c))
-        if env_jh and os.path.normcase(os.path.normpath(env_jh)) \
-                == os.path.normcase(os.path.normpath(home)):
-            return _mk_env("java", "Java JDK", "apktool / JetBrains / 服务端", "ok",
-                           m.group(1) if m else "", c, home=home)
+        bindir = os.path.dirname(c)
+        # v8.14：apktool 等需要的是 JDK（含 javac），光有 java.exe 的 JRE 不算数。
+        if os.path.isfile(os.path.join(bindir, "javac.exe")):
+            if env_jh and os.path.normcase(os.path.normpath(env_jh)) \
+                    == os.path.normcase(os.path.normpath(home)):
+                return _mk_env("java", "Java JDK", "apktool / JetBrains / 服务端", "ok",
+                               ver, c, home=home)
+            return _mk_env("java", "Java JDK", "apktool / JetBrains / 服务端", "warn",
+                           ver, "%s（JAVA_HOME 未指向它）" % c, home=home)
+        if jre_cand is None:
+            jre_cand = (c, ver, home)
+    if jre_cand:
+        c, ver, home = jre_cand
+        # 只装了 JRE：标记 jre_only，让安装流程转为下载真正的 JDK 而非只补 JAVA_HOME
         return _mk_env("java", "Java JDK", "apktool / JetBrains / 服务端", "warn",
-                       m.group(1) if m else "",
-                       "%s（JAVA_HOME 未指向它）" % c, home=home)
+                       ver, "%s（只装了 JRE，缺 javac 编译器，apktool 需要 JDK）"
+                       % c, home=home, jre_only=True)
     return _mk_env("java", "Java JDK", "apktool / JetBrains / 服务端", "miss")
 
 
@@ -1892,6 +1951,13 @@ def _refresh_process_env():
 
 # ---- 下载 / 安装 ----
 
+# v8.14：统一 UA + 接受重定向。Adoptium API 与 GitHub Release 资源都会对
+# 不带 User-Agent 的请求返回 403（这就是原清华/Adoptium 源失败的根因），
+# 带上浏览器 UA 后即可正常拿到 302 重定向并最终 200。
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
 def _fmt_sz(n):
     return "%.1fMB" % (n / 1048576.0) if n >= 1048576 else "%dKB" % max(n // 1024, 1)
 
@@ -1901,8 +1967,13 @@ def _env_download(url, dest, label):
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     _push_log("[环境] %s 下载：%s" % (label, url))
     t_last = 0.0
+    req = urllib.request.Request(
+        url, headers={"User-Agent": _UA, "Accept": "*/*",
+                      "Accept-Encoding": "identity"})
     try:
-        with urllib.request.urlopen(url, timeout=30) as r, open(dest + ".part", "wb") as f:
+        # urllib 默认跟随 302/301 重定向（含 Adoptium→GitHub 的链式跳转），
+        # 这里显式用 Request 仅为了注入 User-Agent，行为不变。
+        with urllib.request.urlopen(req, timeout=30) as r, open(dest + ".part", "wb") as f:
             total = int(r.headers.get("Content-Length") or 0)
             got = 0
             while True:
@@ -2045,12 +2116,26 @@ _ENV_INSTALL = {
                  "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"]},
     "java": {
         "name": "Temurin JDK 21",
-        "file": "OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.msi",
+        # 本地缓存文件名用中性命名（不再写死版本号，避免误导）。实际下载到的
+        # 是 Adoptium 官方 JDK 21 的 .msi（含 javac，apktool 需要的是 JDK 不是 JRE）。
+        "file": "Temurin-JDK21-windows-x64.msi",
         "minsize": 90_000_000, "fix": _fix_java,
-        "urls": ["https://mirrors.tuna.tsinghua.edu.cn/Adoptium/21/jdk/x64/windows/"
-                 "OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.msi",
-                 "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/"
-                 "hotspot/normal/eclipse"]},
+        # v8.14：原清华镜像（硬编码 21.0.5_11）已 404、原 adoptium API 因无 UA 返回
+        # 403，全部失效。改为三级可信回退，均来自 Eclipse Adoptium 官方 / GitHub Releases
+        # （已用 GitHub API 核验 release 标签与 msi 资产确实存在）：
+        #   ① GitHub 最新 release 直链（jdk-21.0.12.1+1）—— 始终为当前最新 21 JDK；
+        #   ② GitHub 锁定版直链（jdk-21.0.5+11）—— 与代码原本意图一致的稳妥兜底；
+        #   ③ Adoptium 官方 API latest（带 UA）—— 永不腐烂的官方源，作末位兜底。
+        # 上面 ①② 的 browser_download_url 已由 GitHub API（200）实证存在；③ 为官方
+        # 契约路径，配合本文件新增的 User-Agent 解决原 403。
+        "urls": [
+            "https://github.com/adoptium/temurin21-binaries/releases/download/"
+            "jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.msi",
+            "https://github.com/adoptium/temurin21-binaries/releases/download/"
+            "jdk-21.0.5%2B11/OpenJDK21U-jdk_x64_windows_hotspot_21.0.5_11.msi",
+            "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/"
+            "hotspot/normal/eclipse",
+        ]},
     "node": {
         "name": "Node.js 22 LTS", "file": "node-v22.14.0-x64.msi",
         "minsize": 28_000_000, "fix": _fix_node,
@@ -2095,7 +2180,8 @@ def _env_fix_one(key):
         return
     # warn：多数是 PATH / JAVA_HOME 没配，先试只修配置，不动安装包
     if st == "warn":
-        if key == "java" and cur.get("home"):
+        # v8.14：java 但只有 JRE（jre_only）→ 补 JAVA_HOME 没用，必须下真正的 JDK
+        if key == "java" and cur.get("home") and not cur.get("jre_only"):
             if _env_set_user("JAVA_HOME", cur["home"]):
                 _push_log("[环境] ✓ JAVA_HOME 已指向 %s（新开终端生效）" % cur["home"])
             return
@@ -2810,6 +2896,153 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
   *,*::before,*::after{animation-duration:.01ms!important;
     animation-iteration-count:1!important;transition-duration:.01ms!important}
 }
+
+/* UI test: glass workbench, isolated from the release build. */
+:root{--bg:#111a1c;--panel:#1a2528;--card:#202d30;--card2:#2a393c;
+ --tx:#edf3f1;--tx2:#bdcecb;--tx3:#93aaa5;--line:#ffffff14;--line2:#ffffff26;
+ --r-md:16px;--r-lg:22px;--r-xl:26px;--glass:rgba(27,40,43,.78)}
+html{scroll-behavior:smooth;scroll-snap-type:y proximity;scroll-padding-top:106px}
+body{background:#111a1c;overflow-x:hidden}
+body::before{background:
+ radial-gradient(ellipse at 8% 12%,#32665a55,transparent 48%),
+ radial-gradient(ellipse at 88% 32%,#66604230,transparent 44%),
+ radial-gradient(ellipse at 58% 94%,#34596544,transparent 52%)}
+body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.035;
+ background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Cpath fill='%23fff' filter='url(%23n)' d='M0 0h160v160H0z'/%3E%3C/svg%3E")}
+.app{max-width:1440px;padding:0 clamp(16px,3vw,42px) 120px}
+.top{position:sticky;top:12px;z-index:80;margin:12px 0 26px;padding:14px 18px;
+ gap:18px;border:1px solid var(--line2);border-radius:20px;background:var(--glass);
+ backdrop-filter:blur(24px) saturate(125%);box-shadow:0 8px 32px #00000020,inset 0 1px #ffffff08;
+ flex-wrap:wrap}
+.brand{padding-bottom:0;font-size:17px;white-space:nowrap}
+.brand .mk{width:32px;height:32px;border-radius:10px;font-size:16px}
+.ver{padding-bottom:0;gap:2px;flex-wrap:wrap}
+.tabs{margin-left:0;background:#0f1c1f70;border-radius:12px;flex:none}
+.tab{padding:8px 15px}
+#topPill{background:#42645d85;border:1px solid #a0dac72a;box-shadow:inset 0 1px #ffffff16}
+.page{padding-top:0;min-width:0}
+.work-intro{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;
+ margin:0 0 24px;scroll-snap-align:start}
+.work-intro h1{font:650 clamp(25px,3vw,36px)/1.2 var(--display);letter-spacing:-1px}
+.work-intro p{color:var(--tx2);font-size:13px;margin-top:9px}
+.test-label{font-size:11px;letter-spacing:1px;color:var(--ac);border:1px solid #74ccb43d;
+ padding:6px 12px;border-radius:99px;white-space:nowrap;background:#4aa48b10}
+#p-main.on{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(260px,.9fr);gap:18px}
+#p-main>.work-intro,#p-main>.vrow,#p-main>.cards,#p-main>#hintbar{grid-column:1/-1;margin-bottom:0}
+.vrow{background:#18282b80;padding:12px 17px;border-left-width:3px;min-width:0}
+.cards{grid-template-columns:1fr 1.6fr 1fr;gap:18px}
+.card{min-height:116px;padding:21px 23px;background:linear-gradient(135deg,#ffffff05,#ffffff00),#203032a8;
+ border-color:var(--line2);box-shadow:0 5px 18px #00000012;border-radius:18px}
+.card::after{width:0}
+.card:first-child{background:linear-gradient(125deg,#2d4e4680,#203032a8)}
+.card .big{font-size:34px;letter-spacing:-1px}
+.card .sub{margin-top:12px;color:var(--tx2)}
+.chips{margin-top:0;gap:7px}
+#hintbar{padding:0 2px;color:var(--tx2)}
+.tlist{align-self:start;border:1px solid var(--line2);background:#182529b0;scroll-snap-align:start}
+.thead{padding:18px 18px;gap:10px;flex-wrap:wrap;min-height:64px}
+.tname{width:auto;min-width:120px;flex:1;font-size:14px}
+.tkey{width:auto;font-size:10px}
+.tstat{font-size:12px;max-width:100%;overflow-wrap:anywhere}
+.tbody{padding:0 18px 18px 36px}.drow{flex-wrap:wrap;gap:5px 10px}
+.pwrap{margin:0;padding:19px;background:#1b292caa;border:1px solid var(--line2);
+ border-radius:18px;align-self:start;position:sticky;top:108px;scroll-snap-align:start}
+.phead{flex-wrap:wrap;gap:8px}.phead .s{width:100%;order:5;font-size:11px;margin-bottom:6px}
+textarea#persona{min-height:340px;max-height:60vh;font-size:12px;background:#101b1ec0;line-height:1.8}
+.dock{bottom:18px;width:min(920px,calc(100vw - 36px));max-width:none;padding:12px 18px;
+ background:rgba(36,52,55,.82);backdrop-filter:blur(28px) saturate(135%);
+ border:1px solid #ffffff26;box-shadow:0 12px 36px #00000040,inset 0 1px #ffffff12;border-radius:22px}
+.dbtn{border-radius:12px;padding:10px 18px}.dbtn.primary{box-shadow:0 3px 12px #4eab8e24}
+.elist,.skgrid,.skgrid.inst{grid-template-columns:repeat(auto-fit,minmax(min(100%,285px),1fr));gap:16px}
+.ecard,.skcard{padding:18px;border-color:var(--line2);background:#203032b0;min-width:0;
+ box-shadow:0 4px 16px #00000012;scroll-snap-align:start}
+.skbar{position:sticky;top:100px;z-index:20;padding:10px;background:var(--glass);
+ backdrop-filter:blur(18px);border:1px solid var(--line2);border-radius:14px;margin:18px 0}
+.sksearch{max-width:none;padding:12px 14px}.sksec{scroll-snap-align:start}
+.logbar{position:sticky;top:102px;z-index:20;background:var(--glass);padding:10px;border-radius:12px;
+ backdrop-filter:blur(18px)}
+body[data-p="log"] .logbox{height:calc(100vh - 248px);min-height:220px;border-color:var(--line2)}
+.veil{background:#071115a8;backdrop-filter:blur(12px)}
+.vcard{background:linear-gradient(140deg,#ffffff09,#ffffff00),rgba(30,46,49,.94);
+ border-color:#ffffff28;border-radius:24px;box-shadow:0 20px 60px #00000040;
+ max-height:calc(100dvh - 36px);overflow-y:auto}
+.cinput{font-family:var(--sans);letter-spacing:1px;font-size:16px;padding:14px}
+.vtitle{letter-spacing:0;font-size:28px}.vfoot{color:var(--tx3)}
+:where(a,input,textarea,.tab):focus-visible{outline:2px solid var(--ac);outline-offset:3px}
+@media(min-width:1250px){.tname{min-width:160px}}
+@media(max-width:1050px){.top{gap:12px}.ver{width:100%;margin-left:0;justify-content:flex-end}
+ .pwrap{top:148px}.skbar,.logbar{top:142px}html{scroll-padding-top:150px}}
+@media(max-width:780px){#p-main.on{grid-template-columns:minmax(0,1fr)}
+ .pwrap{position:relative;top:0}.cards{grid-template-columns:1fr 1fr}.card:nth-child(2){grid-column:1/-1;order:3}
+ .top{top:6px;padding:12px}.tabs{margin-left:auto}.ver{justify-content:flex-start}
+ .dock{flex-wrap:wrap;gap:8px}.dock .spacer{display:none}.dock .snapinfo{flex:1}
+ .dock .dbtn{flex:1;padding:9px 10px}.work-intro{align-items:flex-start}.test-label{font-size:10px}
+ textarea#persona{min-height:220px}.tkey{display:none}.card{min-height:100px}}
+@media(max-width:480px){.brand{font-size:14px}.tab{padding:8px 11px}.tabs{margin-left:0}
+ .work-intro{flex-direction:column;gap:10px}.top{position:relative;top:0}
+ .skbar,.logbar{top:6px}.card{padding:16px}.cards{gap:10px}html{scroll-padding-top:16px}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto;scroll-snap-type:none}}
+
+
+.settings-panel{padding:22px;margin:18px 0;border:1px solid var(--line2);border-radius:18px;background:var(--glass)}
+.settings-panel h2{font-size:17px;margin-bottom:10px}.settings-line{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+.settings-line input{flex:1;min-width:180px}.settings-line input,.settings-line select,#personal-text{
+background:var(--void);color:var(--tx);border:1px solid var(--line2);border-radius:10px;padding:10px;font:13px var(--sans)}
+#personal-text{width:100%;min-height:200px;margin-top:14px;resize:vertical;line-height:1.7}
+body[data-p="settings"] .dock{display:none}.settings-panel .note{overflow-wrap:anywhere}
+
+/* ===== 外观设置：材质 / 主题 / 密度 / 动效（变量由 JS / 服务端注入）===== */
+:root{
+  --glass: oklch(22% .011 200 / 1);          /* 玻璃表面底色（含透明度） */
+  --glass-border: oklch(96% .01 200 / .18);
+  --blur: 0px;                               /* 材质：glass=18px / frosted=9px / solid=0 */
+}
+/* 材质：液态玻璃 / 磨砂 → 主表面加毛玻璃 */
+body[data-mat="glass"] .panel, body[data-mat="glass"] .card,
+body[data-mat="glass"] .settings-panel, body[data-mat="glass"] .vrow,
+body[data-mat="glass"] .tlist, body[data-mat="glass"] .dock,
+body[data-mat="glass"] .tabs, body[data-mat="glass"] .work-intro,
+body[data-mat="frosted"] .panel, body[data-mat="frosted"] .card,
+body[data-mat="frosted"] .settings-panel, body[data-mat="frosted"] .vrow,
+body[data-mat="frosted"] .tlist, body[data-mat="frosted"] .dock,
+body[data-mat="frosted"] .tabs, body[data-mat="frosted"] .work-intro{
+  background: var(--glass);
+  backdrop-filter: blur(var(--blur)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(150%);
+  border-color: var(--glass-border);
+}
+/* 主题：浅色覆盖中性色板 */
+body[data-theme="light"]{
+  --void: oklch(96% .004 200); --bg: oklch(98% .003 200);
+  --panel: oklch(100% .002 200); --card: oklch(99% .003 200);
+  --card2: oklch(96% .004 200); --raise: oklch(93% .006 200);
+  --line: oklch(90% .004 200); --line2: oklch(83% .006 200);
+  --tx: oklch(22% .01 200); --tx2: oklch(42% .01 200); --tx3: oklch(60% .008 200);
+  --glass: oklch(99% .003 200 / 1); --glass-border: oklch(22% .01 200 / .18);
+}
+body[data-theme="light"]::before{opacity:.5}
+/* 密度：紧凑 / 宽松 调整关键留白 */
+body[data-density="compact"] .card,
+body[data-density="compact"] .settings-panel,
+body[data-density="compact"] .vrow{padding:12px 14px}
+body[data-density="compact"] .trow .thead{padding:10px 13px}
+body[data-density="compact"] .app{padding-top:8px}
+body[data-density="compact"] .tab{padding:6px 13px 5px}
+body[data-density="comfortable"] .card,
+body[data-density="comfortable"] .settings-panel,
+body[data-density="comfortable"] .vrow{padding:20px 22px}
+body[data-density="comfortable"] .trow .thead{padding:17px 20px}
+body[data-density="comfortable"] .app{padding-top:30px}
+body[data-density="comfortable"] .tab{padding:8px 22px 7px}
+/* 动效关闭 */
+body.no-motion *, body.no-motion *::before, body.no-motion *::after{
+  animation-duration:.01ms!important; animation-iteration-count:1!important;
+  transition-duration:.01ms!important; transition-delay:0s!important;
+  scroll-behavior:auto!important}
+/* 外观设置控件 */
+.ap-f{display:flex;flex-direction:column;gap:6px;font-size:12.5px;color:var(--tx2);flex:1;min-width:120px}
+.ap-f select{background:var(--void);color:var(--tx);border:1px solid var(--line2);border-radius:10px;padding:8px;font:13px var(--sans)}
+.ap-f input[type=range]{accent-color:var(--ac)}
 </style>
 </head>
 <body data-p="main">
@@ -2823,6 +3056,7 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
       <div class="tab" data-p="env">环境</div>
       <div class="tab" data-p="skills">Skill</div>
       <div class="tab" data-p="log">日志</div>
+      <div class="tab" data-p="settings">设置</div>
     </div>
     <div class="ver"><span class="pill cur" id="verpill">v__VER__ · 当前</span>
       <a class="gh" href="javascript:void(0)" id="topdonate" title="扫码支持作者">捐赠</a>
@@ -2838,6 +3072,8 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
 
   <!-- ========== 目标页 ========== -->
   <div class="page on" id="p-main">
+    <div class="work-intro"><div><h1>客户端工作台</h1><p>查看状态，选择目标，执行操作。</p></div>
+    <span class="test-label">8.14</span></div>
     <div class="vrow">
       <span class="tag">核心</span><span class="pill cur">已就绪</span>
       <span class="cur" id="coreinfo">v__VER__ · 云端下发</span>
@@ -2932,6 +3168,66 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
     <div class="passcard">自证口令：在对应客户端的新会话里单独发
       <code id="passtext">…</code>，它应只回复 <code id="replytext">…</code></div>
   </div>
+  <div class="page" id="p-settings">
+    <div class="work-intro"><div><h1>本地设置</h1><p>安装目录记录与 WorkBuddy 个性化指令</p></div></div>
+    <section class="settings-panel">
+      <h2>自定义安装目录</h2>
+      <p class="note">选择目录并保存为路径记录。此记录独立保存，尚未接入客户端自动检测或破甲动作。</p>
+      <div class="settings-line"><select id="dir-client"><option value="dsh">DSH</option>
+      <option value="workbuddy">WorkBuddy</option><option value="codex">Codex</option>
+      <option value="claude">Claude Code</option></select><input id="dir-path" placeholder="选择安装目录或输入完整路径">
+      <button id="dir-browse">选择目录</button></div>
+      <div class="settings-line"><button id="dir-save">保存目录</button><button id="dir-reset">清除自定义目录</button></div>
+      <p class="note" id="dir-summary"></p>
+    </section>
+    <section class="settings-panel"><h2>WorkBuddy 个性化 · 自定义指令</h2>
+      <p class="note" id="personal-path"></p>
+      <textarea id="personal-text" maxlength="1500" placeholder="输入语言、格式、沟通方式等偏好"></textarea>
+      <div class="settings-line"><button id="personal-preset">填入普通偏好</button>
+      <button id="personal-save">备份并保存</button><button id="personal-restore">恢复上次保存前内容</button>
+      <button id="settings-reload">重新读取</button></div>
+      <p class="note">每次保存前备份原字段；仅恢复自定义指令，不覆盖其他配置。建议退出 WorkBuddy 后保存，重新打开并新建会话检查。</p>
+    </section>
+    <section class="settings-panel">
+      <h2>外观设置</h2>
+      <p class="note">实时预览，改动后自动保存（防抖落盘）；重新打开自动恢复上次外观。</p>
+      <div class="settings-line">
+        <label class="ap-f">材质<select id="ap-material">
+          <option value="glass">液态玻璃</option>
+          <option value="frosted">磨砂</option>
+          <option value="solid">实色</option></select></label>
+        <label class="ap-f">主题<select id="ap-theme">
+          <option value="dark">深色</option>
+          <option value="light">浅色</option></select></label>
+        <label class="ap-f">强调色<select id="ap-accent">
+          <option value="teal">青绿</option>
+          <option value="blue">蓝</option>
+          <option value="violet">紫</option>
+          <option value="green">绿</option>
+          <option value="amber">琥珀</option>
+          <option value="rose">玫红</option>
+          <option value="cyan">青蓝</option></select></label>
+        <label class="ap-f">密度<select id="ap-density">
+          <option value="compact">紧凑</option>
+          <option value="normal">标准</option>
+          <option value="comfortable">宽松</option></select></label>
+      </div>
+      <div class="settings-line">
+        <label class="ap-f" style="flex:2;min-width:240px">透明度
+          <input type="range" id="ap-transparency" min="0" max="100" style="flex:1">
+          <span id="ap-transparency-val" class="mono">0%</span></label>
+        <label class="ap-f" style="flex:none">动效
+          <input type="checkbox" id="ap-motion"></label>
+      </div>
+      <div class="settings-line">
+        <button id="ap-apply">应用并保存</button>
+        <button id="ap-reset">恢复默认外观</button>
+        <span id="ap-status" class="note"></span>
+      </div>
+    </section>
+    <p id="settings-status" role="status"></p>
+  </div>
+
 </div>
 
 <!-- 底部悬浮液态玻璃操作坞 -->
@@ -3047,6 +3343,132 @@ body[data-p="log"] .logbox{height:calc(100vh - 162px)}
 
 <script>
 "use strict";
+
+let USER_SETTINGS = {};
+async function loadUserSettings(action="read", extra={}){
+    const status=document.getElementById("settings-status");
+    status.textContent=action==="browse"?"请选择目录…":"正在处理…";
+    try{
+        const r=await fetch("/api/user-settings",{method:"POST",headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({action,...extra})});
+        const j=await r.json();if(!j.ok)throw new Error(j.err||"操作失败");
+        if(action==="browse"){
+            if(j.path)document.getElementById("dir-path").value=j.path;
+            status.textContent=j.cancelled?"已取消选择":"目录已选择，点击保存目录记录";return;
+        }
+        USER_SETTINGS=j;
+        document.getElementById("dir-path").value=(j.directories||{})[document.getElementById("dir-client").value]||"";
+        document.getElementById("dir-summary").textContent=Object.entries(j.directories||{}).map(([k,v])=>k+"："+v).join(" · ")||"尚未记录自定义目录";
+        document.getElementById("personal-text").value=j.text||"";
+        document.getElementById("personal-path").textContent=j.config_path;
+        document.getElementById("personal-restore").disabled=!j.backup;
+        status.textContent=action==="read"?"设置已读取":"已完成";
+    }catch(e){status.textContent="操作失败："+e.message;}
+}
+document.getElementById("dir-client").onchange=()=>{
+    document.getElementById("dir-path").value=(USER_SETTINGS.directories||{})[document.getElementById("dir-client").value]||"";};
+document.getElementById("dir-browse").onclick=()=>loadUserSettings("browse");
+document.getElementById("dir-save").onclick=()=>loadUserSettings("directory",{client:document.getElementById("dir-client").value,path:document.getElementById("dir-path").value});
+document.getElementById("dir-reset").onclick=()=>loadUserSettings("directory_reset",{client:document.getElementById("dir-client").value});
+document.getElementById("personal-preset").onclick=()=>{document.getElementById("personal-text").value="请使用简体中文，英文术语附中文解释。先给明确结论或可运行结果，再说明用法。代码完整，不留占位符。多步骤任务持续推进，遇到错误说明原因并尝试合理修复。表达直接、清晰，不重复询问是否继续；需要关键参数时只问必要的问题。";};
+document.getElementById("personal-save").onclick=()=>loadUserSettings("personal_save",{text:document.getElementById("personal-text").value});
+document.getElementById("personal-restore").onclick=()=>loadUserSettings("personal_restore");
+document.getElementById("settings-reload").onclick=()=>loadUserSettings();
+
+/* ---- 外观设置：材质 / 主题 / 强调色 / 透明度 / 密度 / 动效 ---- */
+let APPEARANCE = {};
+const AP_DEFAULTS = {material:"solid", theme:"dark", accent:"teal", transparency:0, density:"normal", motion:true};
+const AP_ACCENTS = {
+  teal:  ["oklch(72% .115 192)", "oklch(56% .085 192)", "oklch(72% .115 192 / .12)"],
+  blue:  ["oklch(68% .13 250)",  "oklch(54% .10 250)",  "oklch(68% .13 250 / .12)"],
+  violet:["oklch(70% .15 300)",  "oklch(55% .11 300)",  "oklch(70% .15 300 / .12)"],
+  green: ["oklch(74% .14 152)",  "oklch(58% .10 152)",  "oklch(74% .14 152 / .12)"],
+  amber: ["oklch(80% .14 80)",   "oklch(64% .10 80)",   "oklch(80% .14 80 / .12)"],
+  rose:  ["oklch(72% .16 12)",   "oklch(58% .12 12)",   "oklch(72% .16 12 / .12)"],
+  cyan:  ["oklch(78% .12 200)",  "oklch(62% .09 200)",  "oklch(78% .12 200 / .12)"]
+};
+function apGlass(cfg){
+  const tint = cfg.theme==="light" ? "oklch(99% .003 200)" : "oklch(22% .011 200)";
+  const alpha = cfg.material==="solid" ? 1 : Math.max(0.2, 1 - cfg.transparency/100);
+  const border = (cfg.theme==="light" ? "oklch(22% .01 200)" : "oklch(96% .01 200)") + " / .18";
+  const blur = cfg.material==="glass" ? "18px" : (cfg.material==="frosted" ? "9px" : "0px");
+  return {glass: tint + " / " + alpha.toFixed(3), border: border, blur: blur};
+}
+function applyAppearance(cfg){
+  APPEARANCE = Object.assign({}, AP_DEFAULTS, cfg||{});
+  const a = AP_ACCENTS[APPEARANCE.accent] || AP_ACCENTS.teal;
+  const r = document.documentElement.style;
+  r.setProperty("--ac", a[0]); r.setProperty("--ac-dim", a[1]); r.setProperty("--ac-bg", a[2]);
+  const g = apGlass(APPEARANCE);
+  r.setProperty("--glass", g.glass); r.setProperty("--glass-border", g.border); r.setProperty("--blur", g.blur);
+  const b = document.body;
+  b.dataset.mat = APPEARANCE.material; b.dataset.theme = APPEARANCE.theme; b.dataset.density = APPEARANCE.density;
+  b.classList.toggle("no-motion", !APPEARANCE.motion);
+}
+function apPopulate(cfg){
+  document.getElementById("ap-material").value = cfg.material;
+  document.getElementById("ap-theme").value = cfg.theme;
+  document.getElementById("ap-accent").value = cfg.accent;
+  document.getElementById("ap-density").value = cfg.density;
+  document.getElementById("ap-transparency").value = cfg.transparency;
+  document.getElementById("ap-transparency-val").textContent = cfg.transparency + "%";
+  document.getElementById("ap-motion").checked = !!cfg.motion;
+}
+function apCollect(){
+  return {material:document.getElementById("ap-material").value,
+          theme:document.getElementById("ap-theme").value,
+          accent:document.getElementById("ap-accent").value,
+          transparency:parseInt(document.getElementById("ap-transparency").value,10)||0,
+          density:document.getElementById("ap-density").value,
+          motion:document.getElementById("ap-motion").checked};
+}
+async function loadAppearance(){
+  try{
+    const j = await (await fetch("/api/appearance")).json();
+    const cfg = Object.assign({}, AP_DEFAULTS, j.cfg||{});
+    applyAppearance(cfg); apPopulate(cfg);
+  }catch(e){ applyAppearance(AP_DEFAULTS); apPopulate(AP_DEFAULTS); }
+}
+async function saveAppearance(){
+  const cfg = apCollect(); applyAppearance(cfg);
+  const st = document.getElementById("ap-status"); st.textContent = "保存中…";
+  try{
+    const r = await fetch("/api/appearance",{method:"POST",headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"save", cfg:cfg})});
+    const j = await r.json();
+    st.textContent = j.ok ? "已保存（关闭后依然生效）" : ("保存失败：" + (j.err||""));
+  }catch(e){ st.textContent = "保存失败：" + e.message; }
+}
+/* 防抖保存：任意外观控件改动后 450ms 自动落盘到 appearance.json，避免频繁写文件；
+   实时预览仍由 applyAppearance 立即生效，保存结果通过 ap-status 反馈。 */
+let _apTimer = null;
+function scheduleApSave(){
+  const st = document.getElementById("ap-status");
+  if(st) st.textContent = "调整中…";
+  if(_apTimer) clearTimeout(_apTimer);
+  _apTimer = setTimeout(()=>{ _apTimer = null; saveAppearance(); }, 450);
+}
+document.getElementById("ap-material").onchange = ()=>{applyAppearance(apCollect()); scheduleApSave();};
+document.getElementById("ap-theme").onchange   = ()=>{applyAppearance(apCollect()); scheduleApSave();};
+document.getElementById("ap-accent").onchange = ()=>{applyAppearance(apCollect()); scheduleApSave();};
+document.getElementById("ap-density").onchange= ()=>{applyAppearance(apCollect()); scheduleApSave();};
+document.getElementById("ap-transparency").oninput = ()=>{
+  const v = parseInt(document.getElementById("ap-transparency").value,10)||0;
+  document.getElementById("ap-transparency-val").textContent = v + "%";
+  applyAppearance(apCollect()); scheduleApSave();};
+document.getElementById("ap-motion").onchange = ()=>{applyAppearance(apCollect()); scheduleApSave();};
+document.getElementById("ap-apply").onclick = ()=>{ if(_apTimer){clearTimeout(_apTimer); _apTimer=null;} saveAppearance(); };
+document.getElementById("ap-reset").onclick = async ()=>{
+  applyAppearance(AP_DEFAULTS); apPopulate(AP_DEFAULTS);
+  try{
+    await fetch("/api/appearance",{method:"POST",headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({action:"save", cfg:AP_DEFAULTS})});
+    document.getElementById("ap-status").textContent = "已恢复默认并保存";
+  }catch(e){ document.getElementById("ap-status").textContent = "恢复失败：" + e.message; }
+};
+applyAppearance(AP_DEFAULTS);   /* 先套默认，避免取值前空白 */
+loadAppearance();              /* 再覆盖为已保存外观（关闭重启恢复） */
+
 const $=s=>document.querySelector(s), $$=s=>document.querySelectorAll(s);
 let STATE=null, LOGNEXT=0, LOGTIMER=null, SEL=new Set(), OPEN=new Set(), _lastSig="";
 
@@ -3067,6 +3489,7 @@ $$(".tab").forEach(t=>t.onclick=()=>{
   if(t.dataset.p==="log") logTimerStart(); else logTimerStop();
   if(t.dataset.p==="env") loadEnv();
   if(t.dataset.p==="skills") loadSkills();
+  if(t.dataset.p==="settings"){ loadUserSettings(); loadAppearance(); }
 });
 
 /* ---- 全局点击涟漪（每个按钮按下都有一圈光晕）---- */
@@ -3657,6 +4080,89 @@ function cloudGo(){
 $("#b-cloudgo").onclick=cloudGo;
 $("#cloudgroup").addEventListener("keydown",e=>{if(e.key==="Enter")cloudGo();});
 $("#cloudcode").addEventListener("keydown",e=>{if(e.key==="Enter")cloudGo();});
+
+/* v8.14 粘贴修复：pywebview/WebView2 默认关闭 AreBrowserAcceleratorKeysEnabled
+   与 AreDefaultContextMenusEnabled（仅 debug=True 才开），导致输入框的 Ctrl+V
+   与右键"粘贴"全部失效。这里用原生剪贴板桥（pywebview.api.paste_from_clipboard /
+   copy_to_clipboard，见 Python 侧 _JsApi）兜底，覆盖所有 input/textarea。 */
+function _insertAt(el,text){
+  if(!el||!text) return;
+  var s=el.selectionStart||0, e=el.selectionEnd||0, v=el.value;
+  el.value=v.slice(0,s)+text+v.slice(e);
+  var p=s+text.length; try{ el.selectionStart=el.selectionEnd=p; }catch(_){}
+  el.focus();
+  try{ el.dispatchEvent(new Event("input",{bubbles:true})); }catch(_){}
+}
+function _nativePaste(el){
+  try{ if(navigator.clipboard&&navigator.clipboard.readText){
+    navigator.clipboard.readText().then(function(t){ _insertAt(el,t||""); }).catch(function(){});
+  }}catch(e){}
+}
+function _pasteInto(el){
+  if(!el) return;
+  if(typeof pywebview!=="undefined"&&pywebview.api&&pywebview.api.paste_from_clipboard){
+    Promise.resolve(pywebview.api.paste_from_clipboard()).then(function(t){
+      _insertAt(el, t==null?"":String(t));
+    }).catch(function(){ _nativePaste(el); });
+  } else { _nativePaste(el); }
+}
+function _copyFrom(el){
+  if(!el) return;
+  var txt=el.value||"";
+  if(typeof pywebview!=="undefined"&&pywebview.api&&pywebview.api.copy_to_clipboard){
+    try{ if(pywebview.api.copy_to_clipboard(txt)) return; }catch(_){}
+  }
+  try{ if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(txt); }catch(_){}
+  try{ el.focus(); document.execCommand("copy"); }catch(_){}
+}
+// Ctrl+V / Ctrl+Insert：捕获阶段拦截，preventDefault 阻止失效的原生行为后改用桥
+document.addEventListener("keydown",function(ev){
+  var t=ev.target;
+  var ed=t&&(t.tagName==="INPUT"||t.tagName==="TEXTAREA"||t.isContentEditable);
+  if(!ed) return;
+  var mod=ev.ctrlKey||ev.metaKey;
+  if(mod&&(ev.key==="v"||ev.key==="V"||ev.key==="Insert")){ ev.preventDefault(); _pasteInto(t); }
+},true);
+// 自定义右键菜单（原生右键菜单被 WebView2 禁用）：粘贴 / 复制 / 全选
+document.addEventListener("contextmenu",function(ev){
+  var t=ev.target;
+  var ed=t&&(t.tagName==="INPUT"||t.tagName==="TEXTAREA"||t.isContentEditable);
+  if(!ed) return;
+  ev.preventDefault();
+  _showCtx(t,ev.clientX,ev.clientY);
+});
+var _ctxEl=null;
+function _showCtx(el,x,y){
+  _ctxEl=el;
+  var m=document.getElementById("__pasteCtx");
+  if(!m){
+    m=document.createElement("div"); m.id="__pasteCtx";
+    m.style.cssText="position:fixed;z-index:9999;background:#1c272b;color:#eaf3f1;"+
+      "border:1px solid #ffffff22;border-radius:10px;padding:5px 0;font:13px/1.7 system-ui;"+
+      "box-shadow:0 10px 30px #0008;min-width:116px";
+    [["paste","粘贴"],["copy","复制"],["sel","全选"]].forEach(function(it){
+      var d=document.createElement("div");
+      d.setAttribute("data-act",it[0]); d.textContent=it[1];
+      d.style.cssText="padding:5px 16px;cursor:pointer";
+      d.addEventListener("mousedown",function(e){
+        e.preventDefault(); e.stopPropagation();
+        var act=it[0];
+        if(act==="paste"){ _pasteInto(_ctxEl); }
+        else if(act==="copy"){ _copyFrom(_ctxEl); }
+        else if(act==="sel"){ if(_ctxEl){ _ctxEl.focus(); try{_ctxEl.select();}catch(_){} } }
+        m.style.display="none";
+      });
+      m.appendChild(d);
+    });
+    document.body.appendChild(m);
+  }
+  m.style.display="block";
+  m.style.left=Math.max(4,Math.min(x,innerWidth-130))+"px";
+  m.style.top =Math.max(4,Math.min(y,innerHeight-110))+"px";
+  var hide=function(){ m.style.display="none"; document.removeEventListener("mousedown",hide); };
+  setTimeout(function(){ document.addEventListener("mousedown",hide); },0);
+}
+
 (async function cloudBoot(){
   try{
     const r=await fetch("/api/cloud/state");const s=await r.json();
@@ -3677,6 +4183,162 @@ $("#cloudcode").addEventListener("keydown",e=>{if(e.key==="Enter")cloudGo();});
 
 
 # ---------------------------------------------------------------- HTTP 服务
+
+# Independent user settings; no patch or core action is invoked.
+_SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".workbuddy", "pojia-ui-test")
+_SETTINGS_FILE = os.path.join(_SETTINGS_DIR, "directories.json")
+_PERSONAL_FILE = os.path.join(os.path.expanduser("~"), ".workbuddy", "app", "app-config.json")
+_SETTINGS_LOCK = threading.RLock()
+
+
+def _settings_read(path: str) -> dict:
+    with open(path, encoding="utf-8-sig") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("配置文件不是 JSON 对象")
+    return data
+
+
+def _settings_write(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".ui-test.tmp"
+    with open(tmp, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, ensure_ascii=False, indent=4)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, path)
+
+
+def _user_settings(request: dict) -> dict:
+    with _SETTINGS_LOCK:
+        action = request.get("action", "read")
+        if action in ("directory", "directory_reset"):
+            key = str(request.get("client", ""))
+            if key not in ("dsh", "workbuddy", "codex", "claude"):
+                raise ValueError("请选择客户端")
+            data = _settings_read(_SETTINGS_FILE) if os.path.isfile(_SETTINGS_FILE) else {}
+            if action == "directory_reset":
+                data.pop(key, None)
+            else:
+                path = str(request.get("path", "")).strip().strip('"')
+                path = os.path.abspath(os.path.expandvars(os.path.expanduser(path))) if path else ""
+                if not path or not os.path.isdir(path):
+                    raise ValueError("目录不存在，请选择实际安装目录")
+                data[key] = path
+            _settings_write(_SETTINGS_FILE, data)
+        elif action == "browse":
+            import webview
+            if not webview.windows:
+                raise ValueError("窗口尚未就绪")
+            selected = webview.windows[0].create_file_dialog(webview.FOLDER_DIALOG)
+            return {"ok": True, "path": selected[0] if selected else "", "cancelled": not bool(selected)}
+        elif action in ("personal_save", "personal_restore"):
+            if not os.path.isfile(_PERSONAL_FILE):
+                raise ValueError("未找到 WorkBuddy 个性化配置，请先在 WorkBuddy 设置中保存一次")
+            config = _settings_read(_PERSONAL_FILE)
+            personal = config.setdefault("personalization", {})
+            if not isinstance(personal, dict):
+                raise ValueError("personalization 字段格式异常，未修改")
+            backup = os.path.join(_SETTINGS_DIR, "personalization-backup.json")
+            if action == "personal_restore":
+                old = _settings_read(backup)
+                if old.get("existed"):
+                    personal["customPrompt"] = old["text"]
+                else:
+                    personal.pop("customPrompt", None)
+            else:
+                text = request.get("text", "")
+                if not isinstance(text, str) or len(text) > 1500:
+                    raise ValueError("自定义指令最多 1500 字")
+                _settings_write(backup, {"existed": "customPrompt" in personal,
+                                        "text": personal.get("customPrompt", "")})
+                personal["customPrompt"] = text
+            _settings_write(_PERSONAL_FILE, config)
+        elif action != "read":
+            raise ValueError("未知设置操作")
+        dirs = _settings_read(_SETTINGS_FILE) if os.path.isfile(_SETTINGS_FILE) else {}
+        config = _settings_read(_PERSONAL_FILE) if os.path.isfile(_PERSONAL_FILE) else {}
+        return {"ok": True, "directories": dirs,
+                "text": config.get("personalization", {}).get("customPrompt", ""),
+                "config_path": _PERSONAL_FILE,
+                "backup": os.path.isfile(os.path.join(_SETTINGS_DIR, "personalization-backup.json"))}
+
+
+# ---- 外观设置：本地 appearance.json 原子持久化 ----
+_APPEARANCE_FILE = os.path.join(_SETTINGS_DIR, "appearance.json")
+_APPEARANCE_DEFAULTS = {"material": "solid", "theme": "dark", "accent": "teal",
+                       "transparency": 0, "density": "normal", "motion": True}
+_AP_ACCENTS = {
+    "teal":   ("oklch(72% .115 192)", "oklch(56% .085 192)", "oklch(72% .115 192 / .12)"),
+    "blue":   ("oklch(68% .13 250)",  "oklch(54% .10 250)",  "oklch(68% .13 250 / .12)"),
+    "violet": ("oklch(70% .15 300)",  "oklch(55% .11 300)",  "oklch(70% .15 300 / .12)"),
+    "green":  ("oklch(74% .14 152)",  "oklch(58% .10 152)",  "oklch(74% .14 152 / .12)"),
+    "amber":  ("oklch(80% .14 80)",   "oklch(64% .10 80)",   "oklch(80% .14 80 / .12)"),
+    "rose":   ("oklch(72% .16 12)",   "oklch(58% .12 12)",   "oklch(72% .16 12 / .12)"),
+    "cyan":   ("oklch(78% .12 200)",  "oklch(62% .09 200)",  "oklch(78% .12 200 / .12)"),
+}
+
+
+_AP_MATERIALS = ("glass", "frosted", "solid")
+_AP_THEMES = ("dark", "light")
+_AP_DENSITIES = ("compact", "normal", "comfortable")
+
+
+def _appearance_validate(cfg: dict) -> dict:
+    """枚举 / 范围校验：非法或缺失的值回落默认，保证落盘与启动恢复的数据永远合法。"""
+    cfg = cfg or {}
+    out = dict(_APPEARANCE_DEFAULTS)
+    if cfg.get("material") in _AP_MATERIALS:
+        out["material"] = cfg["material"]
+    if cfg.get("theme") in _AP_THEMES:
+        out["theme"] = cfg["theme"]
+    if cfg.get("accent") in _AP_ACCENTS:
+        out["accent"] = cfg["accent"]
+    try:
+        t = int(cfg.get("transparency", out["transparency"]))
+    except Exception:
+        t = out["transparency"]
+    out["transparency"] = max(0, min(100, t))
+    if cfg.get("density") in _AP_DENSITIES:
+        out["density"] = cfg["density"]
+    out["motion"] = bool(cfg.get("motion", out["motion"]))
+    return out
+
+
+def _appearance_load() -> dict:
+    cfg = dict(_APPEARANCE_DEFAULTS)
+    try:
+        if os.path.isfile(_APPEARANCE_FILE):
+            data = _settings_read(_APPEARANCE_FILE)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if k in _APPEARANCE_DEFAULTS:
+                        cfg[k] = v
+    except Exception:
+        pass
+    return _appearance_validate(cfg)
+
+
+def _appearance_save(cfg: dict) -> None:
+    _settings_write(_APPEARANCE_FILE, _appearance_validate(cfg))
+
+
+def _appearance_inline(cfg: dict) -> str:
+    """服务端在 <head> 注入已保存外观，避免首帧闪烁；JS 启动后再次对齐。"""
+    a = _AP_ACCENTS.get(cfg.get("accent"), _AP_ACCENTS["teal"])
+    tint = "oklch(99% .003 200)" if cfg.get("theme") == "light" else "oklch(22% .011 200)"
+    try:
+        trans = float(cfg.get("transparency", 0))
+    except Exception:
+        trans = 0.0
+    alpha = 1.0 if cfg.get("material") == "solid" else max(0.2, 1 - trans / 100)
+    border = ("oklch(22% .01 200)" if cfg.get("theme") == "light" else "oklch(96% .01 200)") + " / .18"
+    blur = "18px" if cfg.get("material") == "glass" else ("9px" if cfg.get("material") == "frosted" else "0px")
+    return ("<style id=\"ap-inline\">:root{--ac:%s;--ac-dim:%s;--ac-bg:%s;"
+            "--glass:%s / %.3f;--glass-border:%s;--blur:%s}</style>"
+            % (a[0], a[1], a[2], tint, alpha, border, blur))
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):        # 静默访问日志
         pass
@@ -3690,7 +4352,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _page(self):
-        body = HTML.encode("utf-8")
+        cfg = _appearance_load()
+        attrs = ' data-mat="%s" data-theme="%s" data-density="%s"' % (
+            cfg["material"], cfg["theme"], cfg["density"])
+        if not cfg["motion"]:
+            attrs += ' class="no-motion"'
+        html = (HTML
+                .replace('<body data-p="main">',
+                         '<body data-p="main"%s>' % attrs, 1)
+                .replace("</head>", _appearance_inline(cfg) + "\n</head>", 1))
+        body = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -3698,6 +4369,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/api/user-settings":
+            try:
+                return self._json(_user_settings({}))
+            except Exception as exc:
+                return self._json({"ok": False, "err": str(exc)}, 400)
+        if self.path == "/api/appearance":
+            try:
+                return self._json({"ok": True, "cfg": _appearance_load()})
+            except Exception as exc:
+                return self._json({"ok": False, "err": str(exc)}, 400)
         if self.path in ("/", "/index.html"):
             return self._page()
         if self.path.startswith("/api/cloud/state"):
@@ -3765,6 +4446,21 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             return self._json({"ok": False, "err": "请求体不是合法 JSON"}, 400)
+
+        if self.path == "/api/user-settings":
+            try:
+                return self._json(_user_settings(req))
+            except Exception as exc:
+                return self._json({"ok": False, "err": str(exc)}, 400)
+
+        if self.path == "/api/appearance":
+            try:
+                if (req.get("action") or "save") != "save":
+                    return self._json({"ok": False, "err": "未知操作"}, 400)
+                _appearance_save(req.get("cfg", {}) or {})
+                return self._json({"ok": True})
+            except Exception as exc:
+                return self._json({"ok": False, "err": str(exc)}, 400)
 
         if self.path == "/api/cloud/verify":
             if not CLOUD_MODE:
@@ -3863,6 +4559,9 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     import socket as _sock
 
+    # v8.14 加固：启动期反调试 + ca.pem 完整性（先于窗口/HTTP 服务，不拦正常粘贴）
+    _hardening_startup_check()
+
     # v8.5：核心放到后台线程加载（封条自检 + 类初始化约 1-2s），窗口/网页先起，
     # 核心就绪前 API 返回「加载中」，就绪瞬间前端轮询自然拿到真数据。
     threading.Thread(target=_load_core, daemon=True, name="core-loader").start()
@@ -3958,6 +4657,74 @@ def main():
                     except Exception:
                         pass
                     return True
+
+                # ---- v8.14 粘贴/复制修复：原生剪贴板桥 ----
+                # 根因：pywebview 6.2.1 的 edgechromium 后端在 webview.start 非
+                # debug 时把 CoreWebView2.Settings.AreBrowserAcceleratorKeysEnabled
+                # 与 AreDefaultContextMenusEnabled 都置为 False（见
+                # webview/platforms/edgechromium.py:287-288）。结果输入框的
+                # Ctrl+V / Ctrl+C / Ctrl+X 与右键菜单（含"粘贴"）全部失效。
+                # JS 端 Ctrl+V 与自建右键菜单改调下面这两个原生桥，直接从 OS
+                # 剪贴板读写，彻底绕开被禁用的 WebView2 原生粘贴/复制。
+                def paste_from_clipboard(self):
+                    """原生读取系统剪贴板文本（CF_UNICODETEXT）。"""
+                    try:
+                        import ctypes
+                        u32 = ctypes.windll.user32
+                        k32 = ctypes.windll.kernel32
+                        CF_UNICODETEXT = 13
+                        if not u32.OpenClipboard(0):
+                            return ""
+                        try:
+                            h = u32.GetClipboardData(CF_UNICODETEXT)
+                            if not h:
+                                return ""
+                            p = k32.GlobalLock(h)
+                            if not p:
+                                return ""
+                            try:
+                                size = k32.GlobalSize(h)
+                                if size <= 0:
+                                    return ""
+                                # 多留一个 wchar 余量，按字符读取到结尾 \0
+                                buf = ctypes.create_unicode_buffer(size // 2 + 1)
+                                ctypes.memmove(buf, p, size)
+                                return buf.value or ""
+                            finally:
+                                k32.GlobalUnlock(h)
+                        finally:
+                            u32.CloseClipboard()
+                    except Exception:
+                        return ""
+
+                def copy_to_clipboard(self, text):
+                    """原生写入系统剪贴板文本（CF_UNICODETEXT）。"""
+                    try:
+                        import ctypes
+                        u32 = ctypes.windll.user32
+                        k32 = ctypes.windll.kernel32
+                        CF_UNICODETEXT = 13
+                        if not isinstance(text, str):
+                            text = str(text)
+                        n = len(text) + 1
+                        h = k32.GlobalAlloc(0x42, n * 2)   # GMEM_MOVEABLE|GMEM_ZEROINIT
+                        if not h:
+                            return False
+                        p = k32.GlobalLock(h)
+                        if not p:
+                            k32.GlobalFree(h)
+                            return False
+                        ctypes.memmove(p, ctypes.c_wchar_p(text), n * 2)
+                        k32.GlobalUnlock(h)
+                        if not u32.OpenClipboard(0):
+                            k32.GlobalFree(h)
+                            return False
+                        u32.EmptyClipboard()
+                        ok = u32.SetClipboardData(CF_UNICODETEXT, h)
+                        u32.CloseClipboard()
+                        return bool(ok)
+                    except Exception:
+                        return False
 
             win = webview.create_window(
                 "破甲一键通 v%s" % VERSION, url,
